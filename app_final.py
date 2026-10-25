@@ -11,6 +11,7 @@ import secrets
 import hmac
 import threading
 import webbrowser
+from ultralytics import YOLO
 from functools import wraps
 from typing import Dict, List, Optional, Tuple, Any
 
