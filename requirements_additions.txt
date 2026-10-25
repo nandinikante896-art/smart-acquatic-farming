@@ -1,0 +1,6 @@
+
+# additions
+python-dotenv
+requests
+transformers
+torch

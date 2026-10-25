@@ -1,0 +1,3726 @@
+# ============================================================
+# AQUACARE AI - COMPLETE FARMER UI
+# Fish + Prawn Disease Detection | Camera | Upload
+# DO Monitoring | Analytics | Farmer Assistant
+# No Ollama
+# ============================================================
+
+from flask import Flask, request, jsonify, render_template_string
+from werkzeug.utils import secure_filename
+
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
+import base64
+import io
+import os
+import json
+import traceback
+
+# ------------------------------------------------------------
+# OPTIONAL ML IMPORT
+# ------------------------------------------------------------
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except Exception:
+    YOLO_AVAILABLE = False
+
+
+# ============================================================
+# APP CONFIG
+# ============================================================
+
+app = Flask(__name__)
+
+BASE_DIR = Path(r"C:\Users\NANDINI\Desktop\AquaCare_Complete")
+
+FISH_DIR = BASE_DIR / "fish"
+PRAWN_DIR = BASE_DIR / "prawn"
+
+FISH_MODELS = FISH_DIR / "models"
+PRAWN_MODELS = PRAWN_DIR / "models"
+
+FISH_CLASSES = {
+    0: "Healthy Fish",
+    1: "Bacterial Diseases",
+    2: "Parasitic Diseases",
+    3: "White Tail Diseases",
+    4: "Fungal Diseases",
+}
+
+PRAWN_CLASSES = {
+    0: "Healthy",
+    1: "WSSV",
+    2: "Black Gill",
+    3: "WSSV + Black Gill",
+}
+
+# Project screening limits.
+# These are configurable project limits.
+DO_LEVELS = [
+    (5.0, "Optimal", "Good oxygen condition"),
+    (3.0, "Moderate", "Monitor the pond"),
+    (2.0, "Low", "Increase aeration and monitor"),
+    (0.0, "Critical", "Immediate attention required"),
+]
+
+loaded_models = {
+    "fish": None,
+    "prawn": None
+}
+
+loaded_model_paths = {
+    "fish": None,
+    "prawn": None
+}
+
+
+# ============================================================
+# MODEL DISCOVERY
+# ============================================================
+
+def find_best_model(root: Path, preferred_names=None):
+
+    if not root.exists():
+        return None
+
+    preferred_names = preferred_names or []
+
+    # First check preferred locations
+    for name in preferred_names:
+        p = root / name
+        if p.exists():
+            return p
+
+    # Search recursively
+    candidates = list(root.rglob("best.pt"))
+
+    if not candidates:
+        candidates = list(root.rglob("*.pt"))
+
+    if not candidates:
+        return None
+
+    # Prefer trained/final models
+    priority_words = [
+        "final",
+        "disease",
+        "trained",
+        "best"
+    ]
+
+    candidates = sorted(
+        candidates,
+        key=lambda p: (
+            sum(word in str(p).lower() for word in priority_words),
+            p.stat().st_mtime
+        ),
+        reverse=True
+    )
+
+    return candidates[0]
+
+
+def load_models():
+
+    if not YOLO_AVAILABLE:
+        print("Ultralytics is not available.")
+        return
+
+    fish_preferred = [
+        "fish_disease_final_fast/weights/best.pt",
+        "fish_disease_final/weights/best.pt",
+        "fish_disease/weights/best.pt",
+    ]
+
+    prawn_preferred = [
+        "prawn_disease_final_fast/weights/best.pt",
+        "prawn_disease_final/weights/best.pt",
+        "prawn_fast_test/weights/best.pt",
+    ]
+
+    # Fish
+    try:
+        fish_path = find_best_model(FISH_MODELS, fish_preferred)
+
+        if fish_path:
+            loaded_models["fish"] = YOLO(str(fish_path))
+            loaded_model_paths["fish"] = str(fish_path)
+            print("\n[FISH MODEL]")
+            print(fish_path)
+        else:
+            print("\n[FISH MODEL] Not found")
+
+    except Exception as e:
+        print("Fish model error:", e)
+
+    # Prawn
+    try:
+        prawn_path = find_best_model(PRAWN_MODELS, prawn_preferred)
+
+        if prawn_path:
+            loaded_models["prawn"] = YOLO(str(prawn_path))
+            loaded_model_paths["prawn"] = str(prawn_path)
+            print("\n[PRAWN MODEL]")
+            print(prawn_path)
+        else:
+            print("\n[PRAWN MODEL] Not found")
+
+    except Exception as e:
+        print("Prawn model error:", e)
+
+
+load_models()
+
+
+# ============================================================
+# IMAGE HELPERS
+# ============================================================
+
+def image_to_base64(image):
+
+    buffer = io.BytesIO()
+
+    image.save(buffer, format="JPEG", quality=92)
+
+    return (
+        "data:image/jpeg;base64,"
+        + base64.b64encode(buffer.getvalue()).decode("utf-8")
+    )
+
+
+def read_image(file):
+
+    image = Image.open(file)
+
+    # Always RGB
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    # Avoid extremely huge images
+    max_side = 1600
+
+    if max(image.size) > max_side:
+        image.thumbnail((max_side, max_side))
+
+    return image
+
+
+def get_font(size=22):
+
+    possible_fonts = [
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+    ]
+
+    for font in possible_fonts:
+        if os.path.exists(font):
+            try:
+                return ImageFont.truetype(font, size)
+            except Exception:
+                pass
+
+    return ImageFont.load_default()
+
+
+# ============================================================
+# DO ANALYSIS
+# ============================================================
+
+def analyse_do(value):
+
+    try:
+        value = float(value)
+    except Exception:
+        return {
+            "value": None,
+            "level": "Invalid",
+            "message": "Enter a valid DO value."
+        }
+
+    if value >= 5:
+        level = "Optimal"
+        message = "Dissolved oxygen is in the project's optimal screening range."
+    elif value >= 3:
+        level = "Moderate"
+        message = "Monitor oxygen and pond activity."
+    elif value >= 2:
+        level = "Low"
+        message = "Consider increasing aeration and monitoring closely."
+    else:
+        level = "Critical"
+        message = "Immediate attention and aeration monitoring are recommended."
+
+    return {
+        "value": value,
+        "level": level,
+        "message": message
+    }
+
+
+# ============================================================
+# FARMER ASSISTANT
+# ============================================================
+
+def farmer_answer(question):
+
+    q = question.lower().strip()
+
+    # Oxygen
+    if any(x in q for x in [
+        "do",
+        "oxygen",
+        "dissolved oxygen",
+        "ఆక్సిజన్"
+    ]):
+        return (
+            "Dissolved oxygen is important for fish and shrimp health. "
+            "For this AquaCare project, DO >= 5 mg/L is treated as the "
+            "optimal screening range. Lower values should be monitored "
+            "and aeration may need attention."
+        )
+
+    # Ammonia
+    if any(x in q for x in [
+        "ammonia",
+        "nh3",
+        "అమ్మోనియా"
+    ]):
+        return (
+            "High ammonia can stress cultured fish and shrimp. "
+            "Check water quality, feeding quantity, pond waste and "
+            "water exchange according to your farm management practice."
+        )
+
+    # Feeding
+    if any(x in q for x in [
+        "feed",
+        "feeding",
+        "food",
+        "ఆహారం",
+        "ఫీడ్"
+    ]):
+        return (
+            "Feed according to biomass, species, size and farm conditions. "
+            "Avoid excessive feeding because leftover feed can affect water quality."
+        )
+
+    # Aeration
+    if any(x in q for x in [
+        "aerator",
+        "aeration",
+        "aerator",
+        "ఏరేటర్",
+        "ఏరేషన్"
+    ]):
+        return (
+            "Aeration helps maintain dissolved oxygen. "
+            "Monitor DO especially during night, early morning and periods "
+            "of high stocking or cloudy weather."
+        )
+
+    # WSSV
+    if any(x in q for x in [
+        "wssv",
+        "white spot",
+        "white spot syndrome"
+    ]):
+        return (
+            "WSSV is a serious shrimp disease. Common signs can include "
+            "white spots and abnormal behaviour. Image detection is only "
+            "screening support; confirm suspected disease using appropriate "
+            "aquaculture diagnostic procedures."
+        )
+
+    # Black Gill
+    if any(x in q for x in [
+        "black gill",
+        "black_gill",
+        "blackgill"
+    ]):
+        return (
+            "Black gill refers to dark discoloration of shrimp gills. "
+            "Water quality and environmental conditions should be checked, "
+            "and suspected disease should be professionally confirmed."
+        )
+
+    # Fish disease
+    if any(x in q for x in [
+        "fish disease",
+        "fish sick",
+        "చేప వ్యాధి"
+    ]):
+        return (
+            "Upload a clear fish image in Disease Detection. "
+            "AquaCare will run the trained YOLO model and display detected "
+            "objects with bounding boxes when the model detects them."
+        )
+
+    # Prawn disease
+    if any(x in q for x in [
+        "prawn disease",
+        "shrimp disease",
+        "రొయ్య",
+        "రొయ్యల వ్యాధి"
+    ]):
+        return (
+            "Upload a clear shrimp/prawn image. AquaCare can screen the image "
+            "using the available trained model. A model result should not be "
+            "treated as a final veterinary diagnosis."
+        )
+
+    # Water quality
+    if any(x in q for x in [
+        "water quality",
+        "water",
+        "నీటి నాణ్యత",
+        "నీరు"
+    ]):
+        return (
+            "Important pond water parameters include dissolved oxygen, "
+            "temperature, pH, salinity, ammonia and nitrite. "
+            "Monitor them regularly according to species and farm requirements."
+        )
+
+    return (
+        "I can help with fish and prawn farming topics such as "
+        "DO, oxygen, ammonia, feeding, aeration, water quality, "
+        "WSSV, Black Gill and disease screening."
+    )
+
+
+# ============================================================
+# YOLO DETECTION
+# ============================================================
+
+def detect_image(image, animal):
+
+    animal = animal.lower()
+
+    if animal not in ["fish", "prawn"]:
+        animal = "fish"
+
+    model = loaded_models.get(animal)
+
+    if model is None:
+        return {
+            "success": False,
+            "error": f"{animal.title()} disease model was not found.",
+            "detections": [],
+            "image": image_to_base64(image)
+        }
+
+    classes = (
+        FISH_CLASSES
+        if animal == "fish"
+        else PRAWN_CLASSES
+    )
+
+    try:
+
+        results = model.predict(
+            source=image,
+            conf=0.20,
+            imgsz=640,
+            device="cpu",
+            verbose=False
+        )
+
+        result = results[0]
+
+        output = image.copy()
+        draw = ImageDraw.Draw(output)
+
+        font = get_font(20)
+
+        detections = []
+
+        if result.boxes is not None and len(result.boxes) > 0:
+
+            for box in result.boxes:
+
+                xyxy = box.xyxy[0].cpu().tolist()
+
+                x1, y1, x2, y2 = [
+                    int(max(0, v))
+                    for v in xyxy
+                ]
+
+                confidence = float(
+                    box.conf[0].cpu().item()
+                )
+
+                class_id = int(
+                    box.cls[0].cpu().item()
+                )
+
+                label = classes.get(
+                    class_id,
+                    f"Class {class_id}"
+                )
+
+                # Only actual detected object gets box
+                draw.rectangle(
+                    [x1, y1, x2, y2],
+                    outline=(220, 30, 30),
+                    width=5
+                )
+
+                text_label = f"{label}  {confidence * 100:.1f}%"
+
+                bbox = draw.textbbox(
+                    (x1, y1),
+                    text_label,
+                    font=font
+                )
+
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+
+                text_y = max(0, y1 - th - 10)
+
+                draw.rounded_rectangle(
+                    [
+                        x1,
+                        text_y,
+                        x1 + tw + 16,
+                        text_y + th + 10
+                    ],
+                    radius=6,
+                    fill=(220, 30, 30)
+                )
+
+                draw.text(
+                    (x1 + 8, text_y + 5),
+                    text_label,
+                    fill="white",
+                    font=font
+                )
+
+                detections.append({
+                    "class_id": class_id,
+                    "label": label,
+                    "confidence": round(confidence, 4),
+                    "confidence_percent": round(
+                        confidence * 100, 1
+                    ),
+                    "box": [
+                        x1, y1, x2, y2
+                    ]
+                })
+
+        return {
+            "success": True,
+            "animal": animal,
+            "detections": detections,
+            "count": len(detections),
+            "image": image_to_base64(output),
+            "message": (
+                "Detection completed."
+                if detections
+                else "No detection"
+            )
+        }
+
+    except Exception as e:
+
+        traceback.print_exc()
+
+        return {
+            "success": False,
+            "error": str(e),
+            "detections": [],
+            "image": image_to_base64(image)
+        }
+
+
+# ============================================================
+# API: STATUS
+# ============================================================
+
+@app.route("/api/status")
+def status():
+
+    return jsonify({
+        "app": "AquaCare AI",
+        "assistant": "Local Farmer Assistant",
+        "ollama": False,
+        "yolo_available": YOLO_AVAILABLE,
+        "fish_model_loaded": loaded_models["fish"] is not None,
+        "prawn_model_loaded": loaded_models["prawn"] is not None,
+        "fish_model": loaded_model_paths["fish"],
+        "prawn_model": loaded_model_paths["prawn"],
+    })
+
+
+# ============================================================
+# API: DETECTION
+# ============================================================
+
+@app.route("/api/detect", methods=["POST"])
+def api_detect():
+
+    if "image" not in request.files:
+
+        return jsonify({
+            "success": False,
+            "error": "No image received."
+        }), 400
+
+    file = request.files["image"]
+
+    animal = request.form.get(
+        "animal",
+        "fish"
+    )
+
+    if not file.filename:
+
+        return jsonify({
+            "success": False,
+            "error": "No image selected."
+        }), 400
+
+    try:
+
+        image = read_image(file)
+
+        result = detect_image(
+            image,
+            animal
+        )
+
+        return jsonify(result)
+
+    except Exception as e:
+
+        traceback.print_exc()
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# ============================================================
+# API: FARMER ASSISTANT
+# ============================================================
+
+@app.route("/api/farmer", methods=["POST"])
+def api_farmer():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    question = str(
+        data.get("question", "")
+    ).strip()
+
+    if not question:
+
+        return jsonify({
+            "success": False,
+            "answer": "Please enter your question."
+        })
+
+    return jsonify({
+        "success": True,
+        "answer": farmer_answer(question)
+    })
+
+
+# ============================================================
+# API: DO
+# ============================================================
+
+@app.route("/api/do", methods=["POST"])
+def api_do():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    value = data.get("do")
+
+    return jsonify(
+        analyse_do(value)
+    )
+
+
+# ============================================================
+# COMPLETE UI
+# ============================================================
+
+HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0">
+
+<title>AquaCare AI</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+:root {
+    --bg: #07111f;
+    --panel: #0d1b2d;
+    --panel2: #11243a;
+    --border: rgba(255,255,255,.09);
+    --text: #f4f8ff;
+    --muted: #91a4bb;
+    --primary: #18c8a5;
+    --primary2: #08a4e8;
+    --danger: #ff5c6c;
+    --warning: #ffc857;
+    --shadow: 0 20px 60px rgba(0,0,0,.30);
+}
+
+body {
+    font-family:
+        Inter,
+        Segoe UI,
+        Arial,
+        sans-serif;
+
+    background:
+        radial-gradient(
+            circle at 10% 0%,
+            rgba(24,200,165,.14),
+            transparent 28%
+        ),
+        radial-gradient(
+            circle at 90% 10%,
+            rgba(8,164,232,.14),
+            transparent 28%
+        ),
+        var(--bg);
+
+    color: var(--text);
+    min-height: 100vh;
+}
+
+/* SIDEBAR */
+
+.sidebar {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 250px;
+
+    background:
+        rgba(7,17,31,.92);
+
+    border-right: 1px solid var(--border);
+
+    padding: 22px 16px;
+
+    z-index: 50;
+
+    backdrop-filter: blur(20px);
+}
+
+.logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+
+    padding: 10px;
+
+    margin-bottom: 28px;
+}
+
+.logo-icon {
+    width: 46px;
+    height: 46px;
+
+    border-radius: 14px;
+
+    display: grid;
+    place-items: center;
+
+    font-size: 25px;
+
+    background:
+        linear-gradient(
+            135deg,
+            var(--primary),
+            var(--primary2)
+        );
+
+    box-shadow:
+        0 10px 30px rgba(24,200,165,.25);
+}
+
+.logo h1 {
+    font-size: 19px;
+}
+
+.logo span {
+    display: block;
+    color: var(--muted);
+    font-size: 11px;
+    margin-top: 3px;
+}
+
+.nav-title {
+    font-size: 10px;
+    color: #60758e;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    padding: 0 12px 10px;
+}
+
+.nav-btn {
+    width: 100%;
+
+    border: 0;
+
+    color: #b8c8d9;
+
+    background: transparent;
+
+    padding: 13px 14px;
+
+    border-radius: 12px;
+
+    display: flex;
+    align-items: center;
+    gap: 12px;
+
+    cursor: pointer;
+
+    margin-bottom: 5px;
+
+    font-size: 14px;
+
+    text-align: left;
+
+    transition: .2s;
+}
+
+.nav-btn:hover {
+    background: rgba(255,255,255,.05);
+    color: white;
+}
+
+.nav-btn.active {
+    background:
+        linear-gradient(
+            90deg,
+            rgba(24,200,165,.18),
+            rgba(8,164,232,.08)
+        );
+
+    color: white;
+
+    border: 1px solid rgba(24,200,165,.18);
+}
+
+.nav-icon {
+    width: 25px;
+    text-align: center;
+    font-size: 17px;
+}
+
+/* MAIN */
+
+.main {
+    margin-left: 250px;
+    min-height: 100vh;
+}
+
+/* TOP BAR */
+
+.topbar {
+    height: 76px;
+
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    padding: 0 30px;
+
+    border-bottom: 1px solid var(--border);
+
+    background:
+        rgba(7,17,31,.65);
+
+    backdrop-filter: blur(18px);
+
+    position: sticky;
+    top: 0;
+
+    z-index: 30;
+}
+
+.page-title {
+    font-size: 21px;
+    font-weight: 700;
+}
+
+.page-subtitle {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 3px;
+}
+
+.top-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.language {
+    background: var(--panel);
+    color: white;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    outline: none;
+}
+
+.status-pill {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+
+    padding: 9px 12px;
+
+    background: rgba(24,200,165,.08);
+
+    border: 1px solid rgba(24,200,165,.2);
+
+    border-radius: 20px;
+
+    font-size: 12px;
+
+    color: #83e5d1;
+}
+
+.status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--primary);
+    box-shadow: 0 0 10px var(--primary);
+}
+
+/* CONTENT */
+
+.content {
+    padding: 30px;
+}
+
+.page {
+    display: none;
+}
+
+.page.active {
+    display: block;
+}
+
+/* HERO */
+
+.hero {
+    padding: 32px;
+
+    border-radius: 24px;
+
+    background:
+        linear-gradient(
+            135deg,
+            rgba(24,200,165,.15),
+            rgba(8,164,232,.08)
+        );
+
+    border: 1px solid var(--border);
+
+    box-shadow: var(--shadow);
+
+    margin-bottom: 24px;
+}
+
+.hero h2 {
+    font-size: 31px;
+    max-width: 650px;
+    line-height: 1.15;
+}
+
+.hero p {
+    color: var(--muted);
+    max-width: 650px;
+    margin-top: 12px;
+    line-height: 1.6;
+}
+
+.hero-buttons {
+    margin-top: 22px;
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+/* BUTTONS */
+
+.btn {
+    border: 0;
+    border-radius: 11px;
+
+    padding: 12px 17px;
+
+    cursor: pointer;
+
+    font-weight: 600;
+
+    transition: .2s;
+}
+
+.btn-primary {
+    color: white;
+
+    background:
+        linear-gradient(
+            135deg,
+            var(--primary),
+            var(--primary2)
+        );
+
+    box-shadow:
+        0 10px 25px rgba(24,200,165,.18);
+}
+
+.btn-primary:hover {
+    transform: translateY(-2px);
+}
+
+.btn-secondary {
+    color: #d9e6f5;
+    background: #13253a;
+    border: 1px solid var(--border);
+}
+
+.btn-danger {
+    background: rgba(255,92,108,.13);
+    color: #ff8995;
+    border: 1px solid rgba(255,92,108,.2);
+}
+
+/* CARDS */
+
+.grid {
+    display: grid;
+    grid-template-columns:
+        repeat(4, minmax(0, 1fr));
+
+    gap: 16px;
+}
+
+.card {
+    background:
+        linear-gradient(
+            145deg,
+            rgba(17,36,58,.9),
+            rgba(10,26,43,.9)
+        );
+
+    border: 1px solid var(--border);
+
+    border-radius: 18px;
+
+    padding: 20px;
+
+    box-shadow: var(--shadow);
+}
+
+.stat-icon {
+    width: 42px;
+    height: 42px;
+
+    border-radius: 12px;
+
+    display: grid;
+    place-items: center;
+
+    background: rgba(24,200,165,.1);
+
+    font-size: 20px;
+
+    margin-bottom: 15px;
+}
+
+.stat-title {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.stat-value {
+    font-size: 25px;
+    font-weight: 800;
+    margin-top: 5px;
+}
+
+.stat-small {
+    color: #6f849a;
+    font-size: 11px;
+    margin-top: 4px;
+}
+
+/* SECTION */
+
+.section-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    margin: 28px 0 15px;
+}
+
+.section-head h3 {
+    font-size: 18px;
+}
+
+.section-head span {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+/* DETECTION */
+
+.detector {
+    display: grid;
+
+    grid-template-columns:
+        330px 1fr;
+
+    gap: 20px;
+}
+
+.control-card,
+.result-card {
+    background: var(--panel);
+
+    border: 1px solid var(--border);
+
+    border-radius: 20px;
+
+    padding: 22px;
+}
+
+.control-card h3,
+.result-card h3 {
+    margin-bottom: 7px;
+}
+
+.muted {
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.animal-tabs {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin: 20px 0;
+}
+
+.animal-tab {
+    border: 1px solid var(--border);
+    background: #102137;
+    color: #b8c8d9;
+    padding: 12px;
+    border-radius: 10px;
+    cursor: pointer;
+}
+
+.animal-tab.active {
+    background:
+        rgba(24,200,165,.13);
+    color: white;
+    border-color:
+        rgba(24,200,165,.3);
+}
+
+.upload-box {
+    border: 1px dashed #3a526b;
+
+    border-radius: 15px;
+
+    padding: 28px 15px;
+
+    text-align: center;
+
+    cursor: pointer;
+
+    transition: .2s;
+
+    background: rgba(255,255,255,.015);
+}
+
+.upload-box:hover {
+    border-color: var(--primary);
+    background: rgba(24,200,165,.04);
+}
+
+.upload-box input {
+    display: none;
+}
+
+.upload-icon {
+    font-size: 36px;
+    margin-bottom: 10px;
+}
+
+.preview {
+    width: 100%;
+    max-height: 550px;
+
+    object-fit: contain;
+
+    border-radius: 15px;
+
+    background: #050d17;
+
+    border: 1px solid var(--border);
+}
+
+.empty-preview {
+    height: 420px;
+
+    display: grid;
+    place-items: center;
+
+    color: #526a82;
+
+    border: 1px dashed #2d435b;
+
+    border-radius: 15px;
+}
+
+.result-list {
+    margin-top: 18px;
+}
+
+.detection-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    background: #102137;
+
+    border: 1px solid var(--border);
+
+    padding: 13px;
+
+    border-radius: 12px;
+
+    margin-bottom: 8px;
+}
+
+.confidence {
+    color: #78e3cf;
+    font-weight: 700;
+}
+
+.no-detection {
+    padding: 20px;
+
+    border-radius: 13px;
+
+    background: rgba(255,200,87,.06);
+
+    border: 1px solid rgba(255,200,87,.15);
+
+    color: #ffd77e;
+}
+
+/* CAMERA */
+
+.camera-box {
+    position: relative;
+
+    overflow: hidden;
+
+    border-radius: 18px;
+
+    background: #02070d;
+
+    border: 1px solid var(--border);
+
+    min-height: 450px;
+
+    display: grid;
+    place-items: center;
+}
+
+#cameraVideo {
+    width: 100%;
+    max-height: 600px;
+
+    object-fit: cover;
+}
+
+.camera-placeholder {
+    color: #60758e;
+}
+
+.camera-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 9px;
+    margin-top: 15px;
+}
+
+/* DO */
+
+.do-layout {
+    display: grid;
+
+    grid-template-columns:
+        1fr 1fr;
+
+    gap: 20px;
+}
+
+.input {
+    width: 100%;
+
+    padding: 14px;
+
+    border-radius: 11px;
+
+    border: 1px solid var(--border);
+
+    background: #0a1727;
+
+    color: white;
+
+    outline: none;
+
+    font-size: 15px;
+
+    margin: 12px 0;
+}
+
+.do-result {
+    margin-top: 15px;
+
+    padding: 20px;
+
+    border-radius: 15px;
+
+    background: #102137;
+
+    border: 1px solid var(--border);
+}
+
+.do-number {
+    font-size: 40px;
+    font-weight: 800;
+}
+
+.do-level {
+    font-size: 18px;
+    font-weight: 700;
+    margin-top: 3px;
+}
+
+.do-message {
+    color: var(--muted);
+    margin-top: 7px;
+    line-height: 1.5;
+}
+
+/* ASSISTANT */
+
+.assistant {
+    max-width: 900px;
+}
+
+.chat-box {
+    height: 430px;
+
+    overflow-y: auto;
+
+    padding: 20px;
+
+    background:
+        radial-gradient(
+            circle at 50% 0%,
+            rgba(24,200,165,.05),
+            transparent 40%
+        ),
+        #091523;
+
+    border: 1px solid var(--border);
+
+    border-radius: 18px;
+}
+
+.message {
+    max-width: 78%;
+
+    padding: 13px 15px;
+
+    border-radius: 14px;
+
+    margin-bottom: 12px;
+
+    line-height: 1.5;
+
+    font-size: 14px;
+}
+
+.bot {
+    background: #11243a;
+    border: 1px solid var(--border);
+}
+
+.user {
+    background:
+        linear-gradient(
+            135deg,
+            rgba(24,200,165,.22),
+            rgba(8,164,232,.18)
+        );
+
+    border: 1px solid rgba(24,200,165,.15);
+
+    margin-left: auto;
+}
+
+.chat-input {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.chat-input .input {
+    margin: 0;
+}
+
+.mic-btn {
+    width: 52px;
+    flex-shrink: 0;
+}
+
+/* ANALYTICS */
+
+.chart {
+    height: 260px;
+
+    display: flex;
+    align-items: end;
+
+    gap: 13px;
+
+    padding: 25px;
+
+    background: #091725;
+
+    border-radius: 15px;
+
+    border: 1px solid var(--border);
+}
+
+.bar {
+    flex: 1;
+
+    min-width: 25px;
+
+    border-radius:
+        8px 8px 3px 3px;
+
+    background:
+        linear-gradient(
+            to top,
+            var(--primary2),
+            var(--primary)
+        );
+
+    position: relative;
+
+    transition: .3s;
+}
+
+.bar:hover {
+    filter: brightness(1.2);
+}
+
+.bar span {
+    position: absolute;
+
+    top: -24px;
+
+    width: 100%;
+
+    text-align: center;
+
+    font-size: 10px;
+
+    color: var(--muted);
+}
+
+/* FOOTER */
+
+.footer {
+    text-align: center;
+
+    color: #536b83;
+
+    font-size: 11px;
+
+    padding: 25px;
+}
+
+/* MOBILE */
+
+.mobile-menu {
+    display: none;
+}
+
+@media(max-width: 1000px) {
+
+    .grid {
+        grid-template-columns:
+            repeat(2, 1fr);
+    }
+
+    .detector {
+        grid-template-columns: 1fr;
+    }
+
+    .do-layout {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media(max-width: 760px) {
+
+    .sidebar {
+        transform: translateX(-100%);
+        transition: .25s;
+    }
+
+    .sidebar.open {
+        transform: translateX(0);
+    }
+
+    .main {
+        margin-left: 0;
+    }
+
+    .mobile-menu {
+        display: block;
+        background: none;
+        border: 0;
+        color: white;
+        font-size: 24px;
+        margin-right: 10px;
+    }
+
+    .topbar {
+        padding: 0 15px;
+    }
+
+    .content {
+        padding: 15px;
+    }
+
+    .grid {
+        grid-template-columns: 1fr;
+    }
+
+    .hero h2 {
+        font-size: 25px;
+    }
+
+    .status-pill {
+        display: none;
+    }
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<!-- ========================================================
+     SIDEBAR
+========================================================= -->
+
+<aside class="sidebar" id="sidebar">
+
+    <div class="logo">
+
+        <div class="logo-icon">
+            🐟
+        </div>
+
+        <div>
+            <h1>AquaCare AI</h1>
+            <span>Smart Aquaculture</span>
+        </div>
+
+    </div>
+
+    <div class="nav-title">
+        MAIN
+    </div>
+
+    <button class="nav-btn active"
+            onclick="showPage('dashboard',this)">
+        <span class="nav-icon">🏠</span>
+        <span data-i18n="dashboard">Dashboard</span>
+    </button>
+
+    <button class="nav-btn"
+            onclick="showPage('detection',this)">
+        <span class="nav-icon">🔬</span>
+        <span data-i18n="detection">Disease Detection</span>
+    </button>
+
+    <button class="nav-btn"
+            onclick="showPage('camera',this)">
+        <span class="nav-icon">📷</span>
+        <span data-i18n="camera">Camera</span>
+    </button>
+
+    <button class="nav-btn"
+            onclick="showPage('do',this)">
+        <span class="nav-icon">💧</span>
+        <span data-i18n="do">DO Monitoring</span>
+    </button>
+
+    <button class="nav-btn"
+            onclick="showPage('analytics',this)">
+        <span class="nav-icon">📊</span>
+        <span data-i18n="analytics">Analytics</span>
+    </button>
+
+    <button class="nav-btn"
+            onclick="showPage('assistant',this)">
+        <span class="nav-icon">🤖</span>
+        <span data-i18n="assistant">Farmer Assistant</span>
+    </button>
+
+    <div class="nav-title"
+         style="margin-top:25px;">
+        SYSTEM
+    </div>
+
+    <button class="nav-btn"
+            onclick="showPage('settings',this)">
+        <span class="nav-icon">⚙️</span>
+        <span data-i18n="settings">Settings</span>
+    </button>
+
+</aside>
+
+
+<!-- ========================================================
+     MAIN
+========================================================= -->
+
+<main class="main">
+
+    <header class="topbar">
+
+        <div style="display:flex;align-items:center;">
+
+            <button class="mobile-menu"
+                    onclick="toggleSidebar()">
+                ☰
+            </button>
+
+            <div>
+
+                <div class="page-title"
+                     id="pageTitle">
+                    AquaCare Dashboard
+                </div>
+
+                <div class="page-subtitle"
+                     id="pageSubtitle">
+                    Smart aquaculture monitoring system
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="top-actions">
+
+            <div class="status-pill">
+                <span class="status-dot"></span>
+                System Online
+            </div>
+
+            <select class="language"
+                    id="language"
+                    onchange="changeLanguage()">
+
+                <option value="en">English</option>
+                <option value="te">తెలుగు</option>
+                <option value="hi">हिन्दी</option>
+                <option value="ta">தமிழ்</option>
+                <option value="kn">ಕನ್ನಡ</option>
+
+            </select>
+
+        </div>
+
+    </header>
+
+
+    <section class="content">
+
+
+<!-- ========================================================
+     DASHBOARD
+========================================================= -->
+
+<div class="page active"
+     id="dashboard">
+
+    <div class="hero">
+
+        <h2 data-i18n="heroTitle">
+            Smart monitoring for healthier aquaculture
+        </h2>
+
+        <p data-i18n="heroText">
+            Detect fish and prawn diseases, monitor dissolved oxygen,
+            analyse farm conditions and get farming guidance from one
+            simple dashboard.
+        </p>
+
+        <div class="hero-buttons">
+
+            <button class="btn btn-primary"
+                    onclick="openDetection('fish')">
+                🔬 Detect Disease
+            </button>
+
+            <button class="btn btn-secondary"
+                    onclick="showPage('camera')">
+                📷 Open Camera
+            </button>
+
+            <button class="btn btn-secondary"
+                    onclick="showPage('assistant')">
+                🤖 Ask Assistant
+            </button>
+
+        </div>
+
+    </div>
+
+
+    <div class="grid">
+
+        <div class="card">
+
+            <div class="stat-icon">
+                🐟
+            </div>
+
+            <div class="stat-title">
+                Fish Detection
+            </div>
+
+            <div class="stat-value"
+                 id="fishStatus">
+                Ready
+            </div>
+
+            <div class="stat-small">
+                YOLO model
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <div class="stat-icon">
+                🦐
+            </div>
+
+            <div class="stat-title">
+                Prawn Detection
+            </div>
+
+            <div class="stat-value"
+                 id="prawnStatus">
+                Ready
+            </div>
+
+            <div class="stat-small">
+                YOLO model
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <div class="stat-icon">
+                💧
+            </div>
+
+            <div class="stat-title">
+                DO Screening
+            </div>
+
+            <div class="stat-value">
+                5+
+            </div>
+
+            <div class="stat-small">
+                mg/L optimal project range
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <div class="stat-icon">
+                🤖
+            </div>
+
+            <div class="stat-title">
+                Farmer Assistant
+            </div>
+
+            <div class="stat-value">
+                Local
+            </div>
+
+            <div class="stat-small">
+                No Ollama required
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <div class="section-head">
+
+        <h3>
+            Quick Actions
+        </h3>
+
+    </div>
+
+
+    <div class="grid">
+
+        <div class="card"
+             style="cursor:pointer"
+             onclick="openDetection('fish')">
+
+            <div class="stat-icon">
+                🐟
+            </div>
+
+            <h3>Fish Disease</h3>
+
+            <p class="muted">
+                Upload a fish image and detect disease objects.
+            </p>
+
+        </div>
+
+
+        <div class="card"
+             style="cursor:pointer"
+             onclick="openDetection('prawn')">
+
+            <div class="stat-icon">
+                🦐
+            </div>
+
+            <h3>Prawn Disease</h3>
+
+            <p class="muted">
+                Screen shrimp/prawn images with YOLO.
+            </p>
+
+        </div>
+
+
+        <div class="card"
+             style="cursor:pointer"
+             onclick="showPage('do')">
+
+            <div class="stat-icon">
+                💧
+            </div>
+
+            <h3>Check DO</h3>
+
+            <p class="muted">
+                Enter dissolved oxygen and get screening status.
+            </p>
+
+        </div>
+
+
+        <div class="card"
+             style="cursor:pointer"
+             onclick="showPage('assistant')">
+
+            <div class="stat-icon">
+                💬
+            </div>
+
+            <h3>Farmer Help</h3>
+
+            <p class="muted">
+                Ask about oxygen, water quality, feed and disease.
+            </p>
+
+        </div>
+
+    </div>
+
+</div>
+
+
+<!-- ========================================================
+     DETECTION
+========================================================= -->
+
+<div class="page"
+     id="detection">
+
+    <div class="section-head">
+
+        <div>
+            <h3>AI Disease Detection</h3>
+
+            <span>
+                Upload any image or use a captured image
+            </span>
+        </div>
+
+    </div>
+
+
+    <div class="detector">
+
+        <div class="control-card">
+
+            <h3>Detection Setup</h3>
+
+            <p class="muted">
+                Select the cultured animal.
+            </p>
+
+
+            <div class="animal-tabs">
+
+                <button id="fishTab"
+                        class="animal-tab active"
+                        onclick="selectAnimal('fish')">
+                    🐟 Fish
+                </button>
+
+                <button id="prawnTab"
+                        class="animal-tab"
+                        onclick="selectAnimal('prawn')">
+                    🦐 Prawn
+                </button>
+
+            </div>
+
+
+            <label class="upload-box">
+
+                <div class="upload-icon">
+                    📁
+                </div>
+
+                <strong>
+                    Upload Image
+                </strong>
+
+                <div class="muted"
+                     style="margin-top:5px">
+                    JPG / JPEG / PNG
+                </div>
+
+                <input type="file"
+                       id="imageInput"
+                       accept="image/*"
+                       onchange="previewUpload(event)">
+
+            </label>
+
+
+            <div style="margin-top:15px;">
+
+                <button class="btn btn-primary"
+                        style="width:100%"
+                        onclick="runDetection()">
+
+                    🔍 Run Detection
+
+                </button>
+
+            </div>
+
+
+            <div style="margin-top:10px;">
+
+                <button class="btn btn-secondary"
+                        style="width:100%"
+                        onclick="showPage('camera')">
+
+                    📷 Use Camera
+
+                </button>
+
+            </div>
+
+
+            <div class="muted"
+                 style="margin-top:18px;font-size:11px">
+
+                Detection is screening support.
+                It should not replace professional disease diagnosis.
+
+            </div>
+
+        </div>
+
+
+        <div class="result-card">
+
+            <h3>
+                Detection Result
+            </h3>
+
+            <p class="muted"
+               id="resultText">
+                Upload an image to start.
+            </p>
+
+
+            <div id="previewContainer"
+                 style="margin-top:18px">
+
+                <div class="empty-preview">
+                    🖼️
+                    <span style="margin-left:8px">
+                        Image preview
+                    </span>
+                </div>
+
+            </div>
+
+
+            <div class="result-list"
+                 id="detectionResults">
+            </div>
+
+        </div>
+
+    </div>
+
+</div>
+
+
+<!-- ========================================================
+     CAMERA
+========================================================= -->
+
+<div class="page"
+     id="camera">
+
+    <div class="section-head">
+
+        <div>
+            <h3>Farm Camera</h3>
+            <span>
+                Switch between front and rear camera
+            </span>
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="camera-box">
+
+            <video id="cameraVideo"
+                   autoplay
+                   playsinline>
+            </video>
+
+            <div class="camera-placeholder"
+                 id="cameraPlaceholder">
+
+                📷 Camera is off
+
+            </div>
+
+        </div>
+
+
+        <div class="camera-controls">
+
+            <button class="btn btn-primary"
+                    onclick="startCamera('environment')">
+
+                📷 Back Camera
+
+            </button>
+
+            <button class="btn btn-secondary"
+                    onclick="startCamera('user')">
+
+                🤳 Front Camera
+
+            </button>
+
+            <button class="btn btn-secondary"
+                    onclick="captureCamera()">
+
+                📸 Capture
+
+            </button>
+
+            <button class="btn btn-danger"
+                    onclick="stopCamera()">
+
+                ⏹ Stop
+
+            </button>
+
+        </div>
+
+
+        <canvas id="cameraCanvas"
+                style="display:none">
+        </canvas>
+
+        <div id="cameraResult"
+             style="margin-top:20px">
+        </div>
+
+    </div>
+
+</div>
+
+
+<!-- ========================================================
+     DO
+========================================================= -->
+
+<div class="page"
+     id="do">
+
+    <div class="section-head">
+
+        <div>
+            <h3>Dissolved Oxygen Monitoring</h3>
+
+            <span>
+                AquaCare project screening
+            </span>
+        </div>
+
+    </div>
+
+
+    <div class="do-layout">
+
+        <div class="card">
+
+            <h3>Enter DO Value</h3>
+
+            <p class="muted">
+                Enter dissolved oxygen in mg/L.
+            </p>
+
+            <input class="input"
+                   id="doInput"
+                   type="number"
+                   step="0.01"
+                   placeholder="Example: 5.2">
+
+            <button class="btn btn-primary"
+                    onclick="checkDO()">
+
+                Analyze DO
+
+            </button>
+
+
+            <div class="do-result"
+                 id="doResult">
+
+                <div class="muted">
+                    Waiting for value...
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <h3>Screening Guide</h3>
+
+            <div style="margin-top:18px">
+
+                <div class="detection-item">
+                    <span>≥ 5 mg/L</span>
+                    <strong style="color:#70e1cb">
+                        Optimal
+                    </strong>
+                </div>
+
+                <div class="detection-item">
+                    <span>3 – 4.99 mg/L</span>
+                    <strong style="color:#ffd77e">
+                        Moderate
+                    </strong>
+                </div>
+
+                <div class="detection-item">
+                    <span>2 – 2.99 mg/L</span>
+                    <strong style="color:#ffae70">
+                        Low
+                    </strong>
+                </div>
+
+                <div class="detection-item">
+                    <span>&lt; 2 mg/L</span>
+                    <strong style="color:#ff7b89">
+                        Critical
+                    </strong>
+                </div>
+
+            </div>
+
+            <p class="muted"
+               style="margin-top:15px">
+
+                These DO thresholds are configurable screening
+                limits used by AquaCare and can be adjusted
+                according to the selected species and farm requirements.
+
+            </p>
+
+        </div>
+
+    </div>
+
+</div>
+
+
+<!-- ========================================================
+     ANALYTICS
+========================================================= -->
+
+<div class="page"
+     id="analytics">
+
+    <div class="section-head">
+
+        <div>
+            <h3>Farm Analytics</h3>
+
+            <span>
+                Visual project overview
+            </span>
+        </div>
+
+    </div>
+
+
+    <div class="grid">
+
+        <div class="card">
+
+            <div class="stat-icon">
+                💧
+            </div>
+
+            <div class="stat-title">
+                DO Target
+            </div>
+
+            <div class="stat-value">
+                ≥ 5
+            </div>
+
+            <div class="stat-small">
+                mg/L
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <div class="stat-icon">
+                🔬
+            </div>
+
+            <div class="stat-title">
+                Detection
+            </div>
+
+            <div class="stat-value">
+                YOLO
+            </div>
+
+            <div class="stat-small">
+                Object detection
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <div class="stat-icon">
+                📷
+            </div>
+
+            <div class="stat-title">
+                Input
+            </div>
+
+            <div class="stat-value">
+                Image
+            </div>
+
+            <div class="stat-small">
+                Upload / Camera
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <div class="stat-icon">
+                🌐
+            </div>
+
+            <div class="stat-title">
+                Languages
+            </div>
+
+            <div class="stat-value">
+                5
+            </div>
+
+            <div class="stat-small">
+                Multilingual UI
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <div class="section-head">
+
+        <h3>
+            Sample Farm Trend
+        </h3>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="chart">
+
+            <div class="bar"
+                 style="height:55%">
+                <span>3.5</span>
+            </div>
+
+            <div class="bar"
+                 style="height:68%">
+                <span>4.2</span>
+            </div>
+
+            <div class="bar"
+                 style="height:80%">
+                <span>5.0</span>
+            </div>
+
+            <div class="bar"
+                 style="height:72%">
+                <span>4.5</span>
+            </div>
+
+            <div class="bar"
+                 style="height:91%">
+                <span>5.7</span>
+            </div>
+
+            <div class="bar"
+                 style="height:84%">
+                <span>5.2</span>
+            </div>
+
+            <div class="bar"
+                 style="height:96%">
+                <span>6.0</span>
+            </div>
+
+        </div>
+
+    </div>
+
+</div>
+
+
+<!-- ========================================================
+     ASSISTANT
+========================================================= -->
+
+<div class="page"
+     id="assistant">
+
+    <div class="section-head">
+
+        <div>
+            <h3>Farmer Assistant</h3>
+
+            <span>
+                Local aquaculture knowledge assistant
+            </span>
+        </div>
+
+    </div>
+
+
+    <div class="assistant card">
+
+        <div class="chat-box"
+             id="chatBox">
+
+            <div class="message bot">
+
+                👋 Hello! I am AquaCare Farmer Assistant.
+                <br><br>
+
+                Ask me about:
+                <br>
+                • DO / oxygen
+                <br>
+                • Ammonia
+                <br>
+                • Feeding
+                <br>
+                • Aeration
+                <br>
+                • WSSV
+                <br>
+                • Black Gill
+                <br>
+                • Water quality
+                <br>
+                • Fish/Prawn diseases
+
+            </div>
+
+        </div>
+
+
+        <div class="chat-input">
+
+            <input class="input"
+                   id="chatInput"
+                   placeholder="Ask your farming question..."
+                   onkeydown="if(event.key==='Enter') askAssistant()">
+
+            <button class="btn btn-secondary mic-btn"
+                    onclick="startVoice()">
+
+                🎤
+
+            </button>
+
+            <button class="btn btn-primary"
+                    onclick="askAssistant()">
+
+                Send
+
+            </button>
+
+        </div>
+
+
+        <button class="btn btn-secondary"
+                style="margin-top:10px"
+                onclick="speakLastAnswer()">
+
+            🔊 Speak Answer
+
+        </button>
+
+    </div>
+
+</div>
+
+
+<!-- ========================================================
+     SETTINGS
+========================================================= -->
+
+<div class="page"
+     id="settings">
+
+    <div class="section-head">
+
+        <div>
+            <h3>Settings</h3>
+            <span>AquaCare system information</span>
+        </div>
+
+    </div>
+
+
+    <div class="grid">
+
+        <div class="card">
+
+            <div class="stat-icon">
+                🤖
+            </div>
+
+            <h3>AI Engine</h3>
+
+            <p class="muted"
+               style="margin-top:8px">
+
+                YOLO object detection running locally
+                through the Flask backend.
+
+            </p>
+
+        </div>
+
+
+        <div class="card">
+
+            <div class="stat-icon">
+                💬
+            </div>
+
+            <h3>Assistant</h3>
+
+            <p class="muted"
+               style="margin-top:8px">
+
+                Local rule-based aquaculture assistant.
+                No Ollama required.
+
+            </p>
+
+        </div>
+
+
+        <div class="card">
+
+            <div class="stat-icon">
+                🌐
+            </div>
+
+            <h3>Language</h3>
+
+            <p class="muted"
+               style="margin-top:8px">
+
+                English, Telugu, Hindi, Tamil and Kannada.
+
+            </p>
+
+        </div>
+
+
+        <div class="card">
+
+            <div class="stat-icon">
+                🔒
+            </div>
+
+            <h3>Processing</h3>
+
+            <p class="muted"
+               style="margin-top:8px">
+
+                Images are processed by the local Flask application.
+
+            </p>
+
+        </div>
+
+    </div>
+
+</div>
+
+
+<div class="footer">
+    AquaCare AI • Smart Aquaculture Monitoring System
+</div>
+
+
+</section>
+
+</main>
+
+
+<script>
+
+/* ============================================================
+   GLOBAL VARIABLES
+============================================================ */
+
+let selectedAnimal = "fish";
+let cameraStream = null;
+let lastAssistantAnswer = "";
+
+
+/* ============================================================
+   NAVIGATION
+============================================================ */
+
+function showPage(pageId, button=null) {
+
+    document
+        .querySelectorAll(".page")
+        .forEach(page => {
+            page.classList.remove("active");
+        });
+
+    const page = document.getElementById(pageId);
+
+    if (page) {
+        page.classList.add("active");
+    }
+
+    document
+        .querySelectorAll(".nav-btn")
+        .forEach(btn => {
+            btn.classList.remove("active");
+        });
+
+    if (button) {
+        button.classList.add("active");
+    }
+
+    const titles = {
+
+        dashboard: [
+            "AquaCare Dashboard",
+            "Smart aquaculture monitoring system"
+        ],
+
+        detection: [
+            "Disease Detection",
+            "AI-powered fish and prawn image screening"
+        ],
+
+        camera: [
+            "Farm Camera",
+            "Front and rear camera support"
+        ],
+
+        do: [
+            "DO Monitoring",
+            "Dissolved oxygen screening"
+        ],
+
+        analytics: [
+            "Farm Analytics",
+            "Aquaculture project overview"
+        ],
+
+        assistant: [
+            "Farmer Assistant",
+            "Local aquaculture knowledge assistant"
+        ],
+
+        settings: [
+            "Settings",
+            "AquaCare configuration"
+        ]
+
+    };
+
+    if (titles[pageId]) {
+
+        document.getElementById(
+            "pageTitle"
+        ).textContent = titles[pageId][0];
+
+        document.getElementById(
+            "pageSubtitle"
+        ).textContent = titles[pageId][1];
+
+    }
+
+    document
+        .getElementById("sidebar")
+        .classList.remove("open");
+}
+
+
+function toggleSidebar() {
+
+    document
+        .getElementById("sidebar")
+        .classList.toggle("open");
+
+}
+
+
+/* ============================================================
+   DETECTION
+============================================================ */
+
+function openDetection(animal) {
+
+    showPage("detection");
+
+    selectAnimal(animal);
+
+}
+
+
+function selectAnimal(animal) {
+
+    selectedAnimal = animal;
+
+    document
+        .getElementById("fishTab")
+        .classList.toggle(
+            "active",
+            animal === "fish"
+        );
+
+    document
+        .getElementById("prawnTab")
+        .classList.toggle(
+            "active",
+            animal === "prawn"
+        );
+
+}
+
+
+function previewUpload(event) {
+
+    const file =
+        event.target.files[0];
+
+    if (!file) return;
+
+    const url =
+        URL.createObjectURL(file);
+
+    document.getElementById(
+        "previewContainer"
+    ).innerHTML = `
+        <img
+            src="${url}"
+            class="preview"
+            alt="Uploaded image">
+    `;
+
+    document.getElementById(
+        "resultText"
+    ).textContent =
+        "Image ready. Click Run Detection.";
+
+    document.getElementById(
+        "detectionResults"
+    ).innerHTML = "";
+
+}
+
+
+async function runDetection() {
+
+    const input =
+        document.getElementById(
+            "imageInput"
+        );
+
+    if (!input.files.length) {
+
+        alert(
+            "Please upload an image first."
+        );
+
+        return;
+    }
+
+    const file =
+        input.files[0];
+
+    const form =
+        new FormData();
+
+    form.append(
+        "image",
+        file
+    );
+
+    form.append(
+        "animal",
+        selectedAnimal
+    );
+
+
+    document.getElementById(
+        "resultText"
+    ).textContent =
+        "Running detection...";
+
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/detect",
+                {
+                    method: "POST",
+                    body: form
+                }
+            );
+
+        const data =
+            await response.json();
+
+
+        if (!data.success) {
+
+            document.getElementById(
+                "resultText"
+            ).textContent =
+                data.error ||
+                "Detection failed.";
+
+            return;
+        }
+
+
+        document.getElementById(
+            "previewContainer"
+        ).innerHTML = `
+            <img
+                src="${data.image}"
+                class="preview"
+                alt="Detection result">
+        `;
+
+
+        if (data.count === 0) {
+
+            document.getElementById(
+                "resultText"
+            ).textContent =
+                "No detection";
+
+            document.getElementById(
+                "detectionResults"
+            ).innerHTML = `
+                <div class="no-detection">
+                    ⚠️ No object was detected by the
+                    selected model.
+                    <br><br>
+                    Try a clearer image similar to the
+                    training data.
+                </div>
+            `;
+
+            return;
+        }
+
+
+        document.getElementById(
+            "resultText"
+        ).textContent =
+            `${data.count} detection(s) found`;
+
+
+        let html = "";
+
+        data.detections.forEach(
+            item => {
+
+                html += `
+                    <div class="detection-item">
+
+                        <div>
+                            <strong>
+                                ${item.label}
+                            </strong>
+
+                            <div class="muted">
+                                Bounding box:
+                                ${item.box.join(", ")}
+                            </div>
+                        </div>
+
+                        <div class="confidence">
+                            ${item.confidence_percent}%
+                        </div>
+
+                    </div>
+                `;
+
+            }
+        );
+
+
+        document.getElementById(
+            "detectionResults"
+        ).innerHTML = html;
+
+
+    } catch (error) {
+
+        console.error(error);
+
+        document.getElementById(
+            "resultText"
+        ).textContent =
+            "Server connection error.";
+
+    }
+
+}
+
+
+/* ============================================================
+   CAMERA
+============================================================ */
+
+async function startCamera(mode) {
+
+    stopCamera();
+
+    try {
+
+        cameraStream =
+            await navigator.mediaDevices.getUserMedia({
+                video: {
+                    facingMode: {
+                        ideal: mode
+                    },
+                    width: {
+                        ideal: 1280
+                    },
+                    height: {
+                        ideal: 720
+                    }
+                },
+                audio: false
+            });
+
+
+        const video =
+            document.getElementById(
+                "cameraVideo"
+            );
+
+        video.srcObject =
+            cameraStream;
+
+        document.getElementById(
+            "cameraPlaceholder"
+        ).style.display = "none";
+
+
+    } catch (error) {
+
+        console.error(error);
+
+        alert(
+            "Camera permission denied or camera is unavailable."
+        );
+
+    }
+
+}
+
+
+function stopCamera() {
+
+    if (cameraStream) {
+
+        cameraStream
+            .getTracks()
+            .forEach(track => {
+                track.stop();
+            });
+
+        cameraStream = null;
+
+    }
+
+    const video =
+        document.getElementById(
+            "cameraVideo"
+        );
+
+    video.srcObject = null;
+
+    document.getElementById(
+        "cameraPlaceholder"
+    ).style.display = "block";
+
+}
+
+
+function captureCamera() {
+
+    const video =
+        document.getElementById(
+            "cameraVideo"
+        );
+
+    if (!cameraStream) {
+
+        alert(
+            "Start the camera first."
+        );
+
+        return;
+    }
+
+
+    const canvas =
+        document.getElementById(
+            "cameraCanvas"
+        );
+
+    canvas.width =
+        video.videoWidth;
+
+    canvas.height =
+        video.videoHeight;
+
+
+    const ctx =
+        canvas.getContext("2d");
+
+    ctx.drawImage(
+        video,
+        0,
+        0,
+        canvas.width,
+        canvas.height
+    );
+
+
+    canvas.toBlob(
+        async blob => {
+
+            const form =
+                new FormData();
+
+            form.append(
+                "image",
+                blob,
+                "camera_capture.jpg"
+            );
+
+            form.append(
+                "animal",
+                selectedAnimal
+            );
+
+
+            document.getElementById(
+                "cameraResult"
+            ).innerHTML = `
+                <div class="muted">
+                    Detecting captured image...
+                </div>
+            `;
+
+
+            try {
+
+                const response =
+                    await fetch(
+                        "/api/detect",
+                        {
+                            method: "POST",
+                            body: form
+                        }
+                    );
+
+                const data =
+                    await response.json();
+
+
+                if (!data.success) {
+
+                    document.getElementById(
+                        "cameraResult"
+                    ).innerHTML = `
+                        <div class="no-detection">
+                            ${data.error}
+                        </div>
+                    `;
+
+                    return;
+                }
+
+
+                let resultHtml = `
+                    <img
+                        src="${data.image}"
+                        class="preview">
+                `;
+
+
+                if (data.count === 0) {
+
+                    resultHtml += `
+                        <div class="no-detection"
+                             style="margin-top:12px">
+
+                            ⚠️ No detection
+
+                        </div>
+                    `;
+
+                } else {
+
+                    data.detections.forEach(
+                        item => {
+
+                            resultHtml += `
+                                <div class="detection-item"
+                                     style="margin-top:8px">
+
+                                    <strong>
+                                        ${item.label}
+                                    </strong>
+
+                                    <span class="confidence">
+                                        ${item.confidence_percent}%
+                                    </span>
+
+                                </div>
+                            `;
+
+                        }
+                    );
+
+                }
+
+
+                document.getElementById(
+                    "cameraResult"
+                ).innerHTML =
+                    resultHtml;
+
+
+            } catch (error) {
+
+                console.error(error);
+
+                document.getElementById(
+                    "cameraResult"
+                ).innerHTML = `
+                    <div class="no-detection">
+                        Camera detection failed.
+                    </div>
+                `;
+
+            }
+
+        },
+        "image/jpeg",
+        0.92
+    );
+
+}
+
+
+/* ============================================================
+   DO
+============================================================ */
+
+async function checkDO() {
+
+    const value =
+        document.getElementById(
+            "doInput"
+        ).value;
+
+    if (value === "") {
+
+        alert(
+            "Enter DO value."
+        );
+
+        return;
+    }
+
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/do",
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body: JSON.stringify({
+                        do: value
+                    })
+                }
+            );
+
+
+        const data =
+            await response.json();
+
+
+        document.getElementById(
+            "doResult"
+        ).innerHTML = `
+
+            <div class="do-number">
+                ${data.value}
+            </div>
+
+            <div class="do-level">
+                ${data.level}
+            </div>
+
+            <div class="do-message">
+                ${data.message}
+            </div>
+
+        `;
+
+    } catch (error) {
+
+        alert(
+            "Could not connect to server."
+        );
+
+    }
+
+}
+
+
+/* ============================================================
+   FARMER ASSISTANT
+============================================================ */
+
+async function askAssistant() {
+
+    const input =
+        document.getElementById(
+            "chatInput"
+        );
+
+    const question =
+        input.value.trim();
+
+    if (!question) return;
+
+
+    addMessage(
+        question,
+        "user"
+    );
+
+    input.value = "";
+
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/farmer",
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body: JSON.stringify({
+                        question: question
+                    })
+                }
+            );
+
+
+        const data =
+            await response.json();
+
+
+        lastAssistantAnswer =
+            data.answer || "";
+
+
+        addMessage(
+            lastAssistantAnswer,
+            "bot"
+        );
+
+
+    } catch (error) {
+
+        addMessage(
+            "Unable to connect to AquaCare assistant.",
+            "bot"
+        );
+
+    }
+
+}
+
+
+function addMessage(
+    text,
+    type
+) {
+
+    const chat =
+        document.getElementById(
+            "chatBox"
+        );
+
+
+    const div =
+        document.createElement(
+            "div"
+        );
+
+    div.className =
+        "message " + type;
+
+    div.textContent =
+        text;
+
+
+    chat.appendChild(div);
+
+    chat.scrollTop =
+        chat.scrollHeight;
+
+}
+
+
+/* ============================================================
+   VOICE
+============================================================ */
+
+function startVoice() {
+
+    const SpeechRecognition =
+        window.SpeechRecognition ||
+        window.webkitSpeechRecognition;
+
+
+    if (!SpeechRecognition) {
+
+        alert(
+            "Voice input is not supported by this browser."
+        );
+
+        return;
+    }
+
+
+    const language =
+        document.getElementById(
+            "language"
+        ).value;
+
+
+    const recognition =
+        new SpeechRecognition();
+
+
+    const langMap = {
+
+        en: "en-IN",
+        te: "te-IN",
+        hi: "hi-IN",
+        ta: "ta-IN",
+        kn: "kn-IN"
+
+    };
+
+
+    recognition.lang =
+        langMap[language] ||
+        "en-IN";
+
+
+    recognition.interimResults =
+        false;
+
+
+    recognition.onresult =
+        event => {
+
+            const transcript =
+                event.results[0][0].transcript;
+
+            document.getElementById(
+                "chatInput"
+            ).value =
+                transcript;
+
+        };
+
+
+    recognition.onerror =
+        error => {
+
+            console.log(
+                "Speech error:",
+                error
+            );
+
+        };
+
+
+    recognition.start();
+
+}
+
+
+function speakLastAnswer() {
+
+    if (!lastAssistantAnswer) {
+
+        alert(
+            "Ask the assistant something first."
+        );
+
+        return;
+    }
+
+
+    if (!window.speechSynthesis) {
+
+        alert(
+            "Voice output is not supported."
+        );
+
+        return;
+    }
+
+
+    const language =
+        document.getElementById(
+            "language"
+        ).value;
+
+
+    const langMap = {
+
+        en: "en-IN",
+        te: "te-IN",
+        hi: "hi-IN",
+        ta: "ta-IN",
+        kn: "kn-IN"
+
+    };
+
+
+    const speech =
+        new SpeechSynthesisUtterance(
+            lastAssistantAnswer
+        );
+
+
+    speech.lang =
+        langMap[language] ||
+        "en-IN";
+
+
+    window.speechSynthesis.cancel();
+
+    window.speechSynthesis.speak(
+        speech
+    );
+
+}
+
+
+/* ============================================================
+   LANGUAGE
+============================================================ */
+
+const translations = {
+
+    en: {
+
+        dashboard: "Dashboard",
+        detection: "Disease Detection",
+        camera: "Camera",
+        do: "DO Monitoring",
+        analytics: "Analytics",
+        assistant: "Farmer Assistant",
+        settings: "Settings",
+
+        heroTitle:
+            "Smart monitoring for healthier aquaculture",
+
+        heroText:
+            "Detect fish and prawn diseases, monitor dissolved oxygen, analyse farm conditions and get farming guidance from one simple dashboard."
+
+    },
+
+
+    te: {
+
+        dashboard: "డ్యాష్‌బోర్డ్",
+        detection: "వ్యాధి గుర్తింపు",
+        camera: "కెమెరా",
+        do: "DO మానిటరింగ్",
+        analytics: "విశ్లేషణ",
+        assistant: "రైతు సహాయకుడు",
+        settings: "సెట్టింగ్స్",
+
+        heroTitle:
+            "ఆరోగ్యకరమైన ఆక్వాకల్చర్ కోసం స్మార్ట్ మానిటరింగ్",
+
+        heroText:
+            "చేపలు మరియు రొయ్యల వ్యాధులను గుర్తించండి, నీటిలో ఆక్సిజన్‌ను పరిశీలించండి మరియు ఒకే డ్యాష్‌బోర్డ్ ద్వారా ఫార్మ్ సమాచారాన్ని చూడండి."
+
+    },
+
+
+    hi: {
+
+        dashboard: "डैशबोर्ड",
+        detection: "रोग पहचान",
+        camera: "कैमरा",
+        do: "DO मॉनिटरिंग",
+        analytics: "विश्लेषण",
+        assistant: "किसान सहायक",
+        settings: "सेटिंग्स",
+
+        heroTitle:
+            "स्वस्थ एक्वाकल्चर के लिए स्मार्ट मॉनिटरिंग",
+
+        heroText:
+            "मछली और झींगा रोगों की स्क्रीनिंग करें, घुलित ऑक्सीजन की निगरानी करें और एक ही डैशबोर्ड से फार्म की जानकारी देखें।"
+
+    },
+
+
+    ta: {
+
+        dashboard: "டாஷ்போர்டு",
+        detection: "நோய் கண்டறிதல்",
+        camera: "கேமரா",
+        do: "DO கண்காணிப்பு",
+        analytics: "பகுப்பாய்வு",
+        assistant: "விவசாயி உதவியாளர்",
+        settings: "அமைப்புகள்",
+
+        heroTitle:
+            "ஆரோக்கியமான மீன் வளர்ப்பிற்கான ஸ்மார்ட் கண்காணிப்பு",
+
+        heroText:
+            "மீன் மற்றும் இறால் நோய்களை கண்டறிந்து, கரைந்த ஆக்சிஜனை கண்காணித்து, பண்ணை தகவல்களை ஒரே டாஷ்போர்டில் பார்க்கலாம்."
+
+    },
+
+
+    kn: {
+
+        dashboard: "ಡ್ಯಾಶ್‌ಬೋರ್ಡ್",
+        detection: "ರೋಗ ಪತ್ತೆ",
+        camera: "ಕ್ಯಾಮೆರಾ",
+        do: "DO ಮಾನಿಟರಿಂಗ್",
+        analytics: "ವಿಶ್ಲೇಷಣೆ",
+        assistant: "ರೈತ ಸಹಾಯಕ",
+        settings: "ಸೆಟ್ಟಿಂಗ್ಸ್",
+
+        heroTitle:
+            "ಆರೋಗ್ಯಕರ ಅಕ್ವಾಕಲ್ಚರ್‌ಗಾಗಿ ಸ್ಮಾರ್ಟ್ ಮಾನಿಟರಿಂಗ್",
+
+        heroText:
+            "ಮೀನು ಮತ್ತು ಸೀಗಡಿ ರೋಗಗಳನ್ನು ಪತ್ತೆಹಚ್ಚಿ, ಕರಗಿದ ಆಮ್ಲಜನಕವನ್ನು ಗಮನಿಸಿ ಮತ್ತು ಫಾರ್ಮ್ ಮಾಹಿತಿಯನ್ನು ಒಂದೇ ಡ್ಯಾಶ್‌ಬೋರ್ಡ್‌ನಲ್ಲಿ ನೋಡಿ."
+
+    }
+
+};
+
+
+function changeLanguage() {
+
+    const language =
+        document.getElementById(
+            "language"
+        ).value;
+
+
+    const dict =
+        translations[language];
+
+
+    document
+        .querySelectorAll(
+            "[data-i18n]"
+        )
+        .forEach(element => {
+
+            const key =
+                element.getAttribute(
+                    "data-i18n"
+                );
+
+            if (dict[key]) {
+
+                element.textContent =
+                    dict[key];
+
+            }
+
+        });
+
+}
+
+
+/* ============================================================
+   MODEL STATUS
+============================================================ */
+
+async function loadStatus() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/status"
+            );
+
+        const data =
+            await response.json();
+
+
+        document.getElementById(
+            "fishStatus"
+        ).textContent =
+            data.fish_model_loaded
+                ? "Ready"
+                : "Missing";
+
+
+        document.getElementById(
+            "prawnStatus"
+        ).textContent =
+            data.prawn_model_loaded
+                ? "Ready"
+                : "Missing";
+
+
+    } catch (error) {
+
+        console.log(
+            "Status unavailable"
+        );
+
+    }
+
+}
+
+
+loadStatus();
+
+</script>
+
+</body>
+</html>
+"""
+
+
+# ============================================================
+# HOME
+# ============================================================
+
+@app.route("/")
+def home():
+    return render_template_string(HTML)
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("\n==============================================")
+    print("           AQUACARE AI STARTING")
+    print("==============================================")
+
+    print("Ollama: DISABLED")
+    print(
+        "Fish model:",
+        loaded_model_paths["fish"]
+        or "NOT FOUND"
+    )
+
+    print(
+        "Prawn model:",
+        loaded_model_paths["prawn"]
+        or "NOT FOUND"
+    )
+
+    print("URL: http://127.0.0.1:5000")
+
+    print("==============================================\n")
+
+    app.run(
+        host="127.0.0.1",
+        port=5000,
+        debug=False
+    )
